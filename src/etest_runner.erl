@@ -1,166 +1,168 @@
--module (etest_runner).
--compile (export_all).
+-module(etest_runner).
+-export([run_all/0, run_all/1, run_funs/2, noop/0]).
 
 
-% Macro printing the given message to stderr.
--define (stderr (Msg, Args),
-    io:put_chars(standard_error, io_lib:format(Msg, Args))).
-
--define (stderr (Msg), ?stderr(Msg, [])).
-
-
-% The runner will be called without arguments in case no tests were found .
-% Print a descriptive error message, then exit.
 run_all() ->
-    ?stderr("etest: No tests found~n"),
-    erlang:halt().
+    stderr("~p: No tests found.~n", [?MODULE]),
+    erlang:halt(1).
+
+run_all(ModuleNames) ->
+    init_statistics(),
+    stderr("~n"),
+    lists:foreach(fun run_suite/1, ModuleNames),
+    print_statistics(),
+    erlang:halt(get(errors)).
 
 
-run_all(Modules) ->
-    % Init statistics.
-    [put(K, 0) || K <- [errors, success, tests]],
-
-    lists:foreach(fun run/1, Modules),
-
-    Errors = get(errors),
-    SummaryColor = case Errors == 0 of
-        true  -> "\x1b[32;1m";
-        false -> "\x1b[31;1m"
-    end,
-
-    io:format(
-        "~s"
-        "=========================================~n"
-        "  Failed: ~p.  Success: ~p.  Total: ~p."
-        "\x1b[0m~n",
-        [SummaryColor, Errors, get(success), get(tests)]
-    ),
-
-    erlang:halt(Errors).
-
-
-run(Module) ->
-    Tests       = apply_callbacks(Module, testfuns(Module)),
-    BeforeSuite = maybe_fun(Module, before_suite),
-    AfterSuite  = maybe_fun(Module, after_suite),
-
-    require_hook(BeforeSuite, "Suite Setup "),
-    lists:foreach(fun run_test/1, Tests),
-    require_hook(AfterSuite, "Suite Teardown "),
-
+init_statistics() ->
+    _ = [put(K, 0) || K <- [errors, successes, tests]],
     ok.
-
-
-run_test(Test) ->
-    Before = erlang:monotonic_time(),
-
-    try
-        Test()
-    catch
-        _:Error ->
-            inc(errors),
-            format_error("Test ", Error, clean_trace(erlang:get_stacktrace()))
-    end,
-
-    After  = erlang:monotonic_time(),
-    Millis = erlang:convert_time_unit(After - Before, native, milli_seconds),
-
-    DurationStr = lists:flatten(io_lib:format(" ~pms", [Millis])),
-    io:format(string:right(DurationStr, 80, $=)),
-    io:format("~n~n"),
-    ok.
-
-
-format_error(Prefix, Error, Trace) ->
-    io:format("\x1b[31m"),
-    io:format(
-        "~sError:~n\t~p~nStacktrace:~n\t~p~n",
-        [Prefix, Error, Trace]
-    ),
-    io:format("\x1b[0m"),
-    ok.
-
-
-require_hook(Fun, Name) ->
-    try
-        Before = erlang:monotonic_time(),
-        Fun(),
-        After = erlang:monotonic_time(),
-        erlang:convert_time_unit(After - Before, native, milli_seconds)
-    catch
-        _:Error ->
-            format_error(Name, Error, clean_trace(erlang:get_stacktrace())),
-            io:format("~n"),
-            erlang:halt(1)
-    end.
-
-
-testfuns(Module) ->
-    Exports = try
-        Module:module_info(exports)
-    catch
-        _:_ ->
-            ?stderr("etest: ~p: No such module~n", [Module]),
-            erlang:halt(1)
-    end,
-
-    IsFocus = fun({FunName, _}) ->
-        nomatch =/= re:run(atom_to_list(FunName), "^focus_test_")
-    end,
-
-    TestFuns = case lists:filter(IsFocus, Exports) of
-        [] ->
-            IsTest = fun({FunName, _}) ->
-                nomatch =/= re:run(atom_to_list(FunName), "^test_")
-            end,
-            lists:filter(IsTest, Exports);
-        FocusTests -> FocusTests
-    end,
-
-    MakeApplicative = fun({FunName, _}) ->
-        fun() ->
-            inc(tests),
-
-            Msg = lists:flatten(io_lib:format("~p:~p ", [Module, FunName])),
-            io:format(string:left(Msg, 80, $.) ++ "\n"),
-
-            Module:FunName(),
-
-            inc(success)
-        end
-    end,
-    lists:map(MakeApplicative, TestFuns).
-
-
-apply_callbacks(Module, Funs) ->
-    Before = maybe_fun(Module, before_test),
-    After = maybe_fun(Module, after_test),
-    [
-        fun() ->
-            Before(),
-            try Fun() after After() end
-        end
-        || Fun <- Funs
-    ].
-
-
-maybe_fun(Module, FunName) ->
-    case has_fun(Module, FunName) of
-        true  -> fun() -> Module:FunName() end;
-        false -> fun() -> ok end
-    end.
-
-
-has_fun(Module, FunName) ->
-    Exports = Module:module_info(exports),
-    proplists:is_defined(FunName, Exports).
-
-
-clean_trace(Trace0) ->
-    % Remove the lower etest stack.
-    {_ETestTrace, TraceR} = lists:split(5, lists:reverse(Trace0)),
-    lists:reverse(TraceR).
-
 
 inc(Name) ->
     put(Name, get(Name) + 1).
+
+print_statistics() ->
+    Errors = get(errors),
+    Stats = lists:flatten(io_lib:format(
+                            "    Failed:  ~p"
+                            "    Success: ~p"
+                            "    Total:   ~p",
+                            [Errors, get(successes), get(tests)])),
+    Banner = string:copies("#", length(Stats) + 4),
+    Summary = io_lib:format("~s~n~s~n~n", [Banner, Stats]),
+    Color = summary_color(Errors),
+    stderr(colorize(Summary, Color)).
+
+
+summary_color(0) -> green;
+summary_color(_) -> red.
+
+colorize(String, Color) ->
+    io_lib:format("~s~s~s", [ascii_color(Color), String, ascii_color(reset)]).
+
+ascii_color(reset) -> "\x1b[0m";
+ascii_color(red) -> "\x1b[31m";
+ascii_color(green) -> "\x1b[32m".
+
+
+run_suite(Module) ->
+    Tests = test_functions(Module),
+    {BeforeSuiteMod, BeforeSuiteFun} = maybe_fun(Module, before_suite),
+    {AfterSuiteMod, AfterSuiteFun}  = maybe_fun(Module, after_suite),
+    BeforeTest = maybe_fun(Module, before_test),
+    AfterTest = maybe_fun(Module, after_test),
+
+    try
+        BeforeSuiteMod:BeforeSuiteFun(),
+        lists:foreach(fun(T) -> run_test(T, [BeforeTest, T, AfterTest]) end, Tests),
+        AfterSuiteMod:AfterSuiteFun()
+    catch
+        _:Error ->
+            inc(errors),
+            print_error(Error, erlang:get_stacktrace()),
+            stderr("~n")
+    end,
+    ok.
+
+test_functions(Module) ->
+    Functions = exported_functions(Module),
+    TestFunctions = lists:filter(fun is_test_function/1, Functions),
+    FocusFunctions = lists:filter(fun is_focus_test/1, TestFunctions),
+
+    ActiveFunctions =
+        case FocusFunctions of
+            [] -> TestFunctions;
+            _  -> FocusFunctions
+        end,
+
+    [{Module, F} || F <- ActiveFunctions].
+
+exported_functions(Module) ->
+    try
+        [Function || {Function, _Artiy} <- Module:module_info(exports)]
+    catch
+        _:Error ->
+            print_error(Error, erlang:get_stacktrace()),
+            erlang:halt(1)
+    end.
+
+is_test_function(Function) ->
+    re:run(atom_to_list(Function), "^(focus_)?test_") =/= nomatch.
+
+is_focus_test(Function) ->
+    re:run(atom_to_list(Function), "^focus_") =/= nomatch.
+
+maybe_fun(Module, Function) ->
+    case proplists:is_defined(Function, Module:module_info(exports)) of
+        true  -> {Module, Function};
+        false -> {?MODULE, noop}
+    end.
+
+
+run_test({TestModule, TestFunction}, Functions) ->
+    inc(tests),
+
+    HeaderPrefix = lists:flatten(io_lib:format("~p : ~p ", [TestModule, TestFunction])),
+    Header = string:left(HeaderPrefix, 80, $.),
+    stderr("~s~n", [Header]),
+
+    Before = erlang:monotonic_time(),
+    try
+        run_with_timeout(Functions, 5000),
+        inc(successes)
+    catch
+        _:Error ->
+            inc(errors),
+            handle_error(Error)
+    end,
+
+    After = erlang:monotonic_time(),
+    Millis = erlang:convert_time_unit(After - Before, native, milli_seconds),
+    DurationStr = lists:flatten(io_lib:format(" ~pms", [Millis])),
+    Footer = string:right(DurationStr, 80, $=),
+    stderr("~s~n~n", [Footer]),
+
+    ok.
+
+
+handle_error({error, {Module, Function, Error, Trace}}) ->
+    print_error(Error, {{function, Module, Function}, {stacktrace, Trace}});
+
+handle_error({timeout, Timeout, Pid, ProcessInfo}) ->
+    print_error({timeout, Timeout}, {{pid, Pid}, {process_info, ProcessInfo}}).
+
+print_error(Error, Trace) ->
+    Message = io_lib:format("Error:~n\t~p~nContext:~n\t~p~n", [Error, Trace]),
+    stderr(colorize(Message, red)),
+    ok.
+
+stderr(Format) -> io:format(standard_error, Format, []).
+stderr(Format, Args) -> io:format(standard_error, Format, Args).
+
+
+run_with_timeout(Functions, Timeout) ->
+    Pid = spawn(?MODULE, run_funs, [Functions, self()]),
+    receive
+        ok -> ok;
+        {error, Reason} -> throw({error, Reason})
+    after
+        Timeout ->
+            ProcessInfo = process_info(Pid),
+            exit(Pid, kill),
+            throw({timeout, Timeout, Pid, ProcessInfo})
+    end.
+
+run_funs([], Parent) -> Parent ! ok;
+
+run_funs([{Module, Function}|Rest], Parent) ->
+    try
+        Module:Function(),
+        run_funs(Rest, Parent)
+    catch
+        _:Error ->
+            Trace = erlang:get_stacktrace(),
+            Parent ! {error, {Module, Function, Error, Trace}}
+    end.
+
+
+noop() -> ok.
